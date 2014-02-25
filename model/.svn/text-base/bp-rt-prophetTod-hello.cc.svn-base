@@ -1,0 +1,198 @@
+/*
+ * bp-rt-prophet-hello.cc
+ *
+ *  Created on: 12/04/2012
+ *      Author: Sérgio Vieira
+ */
+
+#include "bp-rt-prophetTod-hello.h"
+#include "ieee754.h"
+
+NS_LOG_COMPONENT_DEFINE ("ProphetTodHelloHeader");
+
+
+
+
+namespace ns3 {
+namespace bundleProtocol {
+
+NS_OBJECT_ENSURE_REGISTERED (ProphetTodHelloHeader);
+
+ProphetTodHelloHeader::ProphetTodHelloHeader() {
+
+}
+
+/* Adicionar número do eid e probabilidade dos vizinhos */
+
+void ProphetTodHelloHeader::addProbability(const BundleEndpointId &dst_eid, const double &probability) {
+	NS_LOG_DEBUG("dst_eid=" << dst_eid << " probability=" << probability);
+	m_plist[dst_eid] = probability;
+}
+
+double ProphetTodHelloHeader::GetProbability(const BundleEndpointId &dst_eid) {
+	NS_LOG_DEBUG("dst_eid=" << dst_eid);
+	return m_plist[dst_eid];
+}
+
+int ProphetTodHelloHeader::GetSize() {
+	NS_LOG_DEBUG("size=" << m_plist.size());
+	return m_plist.size();
+}
+
+ProbabilitiesList ProphetTodHelloHeader::GetNeighList() {
+	return m_plist;
+}
+
+
+/* Fim */
+
+
+TypeId
+ProphetTodHelloHeader::GetTypeId (void)
+{
+  static TypeId tid = TypeId ("ns3::bundleProtocol::ProphetTodHelloHeader")
+    .SetParent<Header> ()
+    .AddConstructor<ProphetTodHelloHeader> ();
+  return tid;
+}
+
+TypeId
+ProphetTodHelloHeader::GetInstanceTypeId (void) const
+{
+  return GetTypeId ();
+}
+
+void
+ProphetTodHelloHeader::Print (std::ostream &os) const
+{
+  os << "ProphetTodHelloHeader: eid = " << m_eid << "\n Vector Velocity = (" << getVel().x <<","<<getVel().y<<")"<<"\n Vector Pos = (" << getPos().x <<","<<getPos().y<<")";
+}
+
+uint32_t
+ProphetTodHelloHeader::GetSerializedSize (void) const
+{
+	uint32_t eid_size = m_eid.GetSerializedSize();
+	return eid_size + 4 + sizeof(uint32_t) + (m_plist.size() * (eid_size + 4 + sizeof(double))) + 32 + 8;
+}
+
+
+
+void ProphetTodHelloHeader::Serialize(Buffer::Iterator start) const {
+	/* enviando EID, isso é obrigatório pq tá amarrado ao LinkManager */
+	int length = m_eid.GetSerializedSize();
+	Buffer::Iterator i = start;
+	i.WriteU32(length);
+	uint8_t buf[length];
+	m_eid.Serialize(buf);
+	i.Write(buf, length);
+
+	/* novos campos */
+
+	i.WriteU32(m_plist.size()); // quantidade de registros de vizinhos
+	ProbabilitiesList::const_iterator it;
+	/* Na hora de serializar, a ordem é U64, U32 , mas na hora de deserializar a ordem é U32, U64, não
+	 * me pergunte pq!! mas só funciona assim - PROBLEMA CORRIGIDO
+	 * O PROBLEMA ERA QUE NO GETTYPE O PARENT TAVA DEFINIDO COMO HEADER, NA VERDADE ERA PRA SER
+	 * NEIGHHEADER
+	 */
+	for (it = m_plist.begin(); it != m_plist.end(); ++it) {
+		BundleEndpointId eid = (*it).first;
+		double p = (*it).second;
+		//NS_LOG_DEBUG("eid = " << eid << " - p = " << p );
+
+		/*i.WriteU32(eid); // n. do eid do vizinho*/
+
+		int length2 = eid.GetSerializedSize();
+		/*Buffer::Iterator i = start;*/
+		i.WriteU32(length2);
+		uint8_t buf2[length];
+		eid.Serialize(buf2);
+		i.Write(buf2, length2);
+
+		i.WriteU64(pack754_64(p)); // probabilidade de entrega para esse vizinho
+	}
+
+    i.WriteU64(pack754_64(m_pos.x));
+    i.WriteU64(pack754_64(m_pos.y));
+
+    i.WriteU64(pack754_64(m_vel.x));
+    i.WriteU64(pack754_64(m_vel.y));
+
+    i.WriteU64(pack754_64(m_timeStamp.GetSeconds()));
+
+
+}
+
+uint32_t ProphetTodHelloHeader::Deserialize(Buffer::Iterator start) {
+	Buffer::Iterator i = start;
+	uint32_t length = i.ReadU32();
+	uint8_t buf[length];
+	i.Read(buf, length);
+	m_eid = BundleEndpointId::Deserialize(buf);
+
+	uint32_t size = i.ReadU32();
+	//NS_LOG_DEBUG("size=" << size);
+	for (uint32_t j = 0; j < size; j++) {
+		/*uint32_t eid_ = i.ReadU32();*/
+
+		uint32_t length2 = i.ReadU32();
+		uint8_t buf2[length2];
+		i.Read(buf2, length2);
+		BundleEndpointId eid_ = BundleEndpointId::Deserialize(buf2);
+
+		double p_ = unpack754_64(i.ReadU64());
+		//NS_LOG_DEBUG("eid = " << eid_ << " - p = " << p_ );
+		m_plist[eid_] = p_;
+	}
+	 m_pos.x = unpack754_64(i.ReadU64());
+	m_pos.y = unpack754_64(i.ReadU64());
+
+	m_vel.x = unpack754_64(i.ReadU64());
+	m_vel.y = unpack754_64(i.ReadU64());
+
+	m_timeStamp = Seconds(unpack754_64(i.ReadU64()));
+
+	return GetSerializedSize();
+}
+
+void
+ProphetTodHelloHeader::SetBundleEndpointId (BundleEndpointId eid)
+{
+  m_eid = eid;
+}
+
+BundleEndpointId
+ProphetTodHelloHeader::GetBundleEndpointId () const
+{
+  return m_eid;
+}
+
+void ProphetTodHelloHeader::setPos(double x, double y) {
+        m_pos.x = x;
+        m_pos.y = y;
+}
+
+void ProphetTodHelloHeader::setVel(double x, double y) {
+        m_vel.x = x;
+        m_vel.y = y;
+}
+
+Vector2d ProphetTodHelloHeader::getPos() const {
+        return m_pos;
+}
+
+Vector2d ProphetTodHelloHeader::getVel() const{
+        return m_vel;
+}
+
+void ProphetTodHelloHeader::setTimeStamp(Time timeStamp) {
+        m_timeStamp = timeStamp;
+}
+
+Time ProphetTodHelloHeader::getTimeStamp() const {
+        return m_timeStamp;
+}
+
+
+}
+}

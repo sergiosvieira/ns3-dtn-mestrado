@@ -1,0 +1,236 @@
+/*
+ * bp-rt-antmofo-hello.cc
+ *
+ *  Created on: 14/06/2012
+ *      Author: joagf
+ */
+
+#include "bp-rt-antmofo-hello.h"
+
+//#include "ieee754.h"
+
+NS_LOG_COMPONENT_DEFINE ("AntMofoHelloHeader");
+
+#define mpack754_32(f) (mpack754((f), 32, 8))
+#define mpack754_64(f) (mpack754((f), 64, 11))
+#define munpack754_32(i) (munpack754((i), 32, 8))
+#define munpack754_64(i) (munpack754((i), 64, 11))
+
+/* IEEE 754 pack unpack */
+
+uint64_t mpack754(long double f, unsigned bits, unsigned expbits)
+{
+    long double fnorm;
+    int shift;
+    long long sign, exp, significand;
+    unsigned significandbits = bits - expbits - 1; // -1 for sign bit
+
+    if (f == 0.0) return 0; // get this special case out of the way
+
+    // check sign and begin normalization
+    if (f < 0) { sign = 1; fnorm = -f; }
+    else { sign = 0; fnorm = f; }
+
+    // get the normalized form of f and track the exponent
+    shift = 0;
+    while(fnorm >= 2.0) { fnorm /= 2.0; shift++; }
+    while(fnorm < 1.0) { fnorm *= 2.0; shift--; }
+    fnorm = fnorm - 1.0;
+
+    // calculate the binary form (non-float) of the significand data
+    significand = fnorm * ((1LL<<significandbits) + 0.5f);
+
+    // get the biased exponent
+    exp = shift + ((1<<(expbits-1)) - 1); // shift + bias
+
+    // return the final answer
+    return (sign<<(bits-1)) | (exp<<(bits-expbits-1)) | significand;
+}
+
+long double munpack754(uint64_t i, unsigned bits, unsigned expbits)
+{
+    long double result;
+    long long shift;
+    unsigned bias;
+    unsigned significandbits = bits - expbits - 1; // -1 for sign bit
+
+    if (i == 0) return 0.0;
+
+    // pull the significand
+    result = (i&((1LL<<significandbits)-1)); // mask
+    result /= (1LL<<significandbits); // convert back to float
+    result += 1.0f; // add the one back on
+
+    // deal with the exponent
+    bias = (1<<(expbits-1)) - 1;
+    shift = ((i>>significandbits)&((1LL<<expbits)-1)) - bias;
+    while(shift > 0) { result *= 2.0; shift--; }
+    while(shift < 0) { result /= 2.0; shift++; }
+
+    // sign it
+    result *= (i>>(bits-1))&1? -1.0: 1.0;
+
+    return result;
+}
+
+
+namespace ns3 {
+namespace bundleProtocol {
+
+NS_OBJECT_ENSURE_REGISTERED (AntMofoHelloHeader);
+
+AntMofoHelloHeader::AntMofoHelloHeader() {
+
+}
+
+void AntMofoHelloHeader::addNeigh(const BundleEndpointId &dst_eid) {
+  m_nlist.push_back(dst_eid);
+}
+
+
+
+int AntMofoHelloHeader::GetSize() {
+        NS_LOG_DEBUG("size=" << m_nlist.size());
+        return m_nlist.size();
+}
+
+Neighs AntMofoHelloHeader::GetNeighList() {
+        return m_nlist;
+}
+
+
+/* Fim */
+
+
+TypeId AntMofoHelloHeader::GetTypeId(void) {
+        static TypeId tid = TypeId("ns3::bundleProtocol::AntMofoHelloHeader")
+                        .SetParent<Header>()
+                        .AddConstructor<AntMofoHelloHeader>();
+
+        return tid;
+}
+
+TypeId AntMofoHelloHeader::GetInstanceTypeId(void) const {
+        return GetTypeId();
+}
+
+void
+AntMofoHelloHeader::Print (std::ostream &os) const
+{
+  os << "AntMofoHelloHeader: eid = " << m_eid << " position = (" << m_pos.x << ", " << m_pos.y << ")  velocity = (" << m_vel.x << ", " << m_vel.y << ")";
+}
+
+uint32_t
+AntMofoHelloHeader::GetSerializedSize (void) const
+{
+        uint32_t eid_size = m_eid.GetSerializedSize();
+        return eid_size + 4 + sizeof(uint32_t) + (m_nlist.size() * (eid_size + 4)) + 4 * sizeof(double);
+}
+
+
+
+void AntMofoHelloHeader::Serialize(Buffer::Iterator start) const {
+        /* enviando EID, isso é obrigatório pq tá amarrado ao LinkManager */
+        int length = m_eid.GetSerializedSize();
+        Buffer::Iterator i = start;
+        i.WriteU32(length);
+        uint8_t buf[length];
+        m_eid.Serialize(buf);
+        i.Write(buf, length);
+
+        /* novos campos */
+
+        i.WriteU32(m_nlist.size()); // quantidade de registros de vizinhos
+        Neighs::const_iterator it;
+        /* Na hora de serializar, a ordem é U64, U32 , mas na hora de deserializar a ordem é U32, U64, não
+         * me pergunte pq!! mas só funciona assim - PROBLEMA CORRIGIDO
+         * O PROBLEMA ERA QUE NO GETTYPE O PARENT TAVA DEFINIDO COMO HEADER, NA VERDADE ERA PRA SER
+         * NEIGHHEADER
+         */
+        for (it = m_nlist.begin(); it != m_nlist.end(); ++it) {
+                BundleEndpointId eid = *it;
+                //double p = (*it).second;
+                //NS_LOG_DEBUG("eid = " << eid << " - p = " << p );
+
+                /*i.WriteU32(eid); // n. do eid do vizinho*/
+
+                int length2 = eid.GetSerializedSize();
+                /*Buffer::Iterator i = start;*/
+                i.WriteU32(length2);
+                uint8_t buf2[length];
+                eid.Serialize(buf2);
+                i.Write(buf2, length2);
+
+                //i.WriteU64(pack754_64(p)); // probabilidade de entrega para esse vizinho
+        }
+        i.WriteU64(mpack754_64(m_pos.x));
+        i.WriteU64(mpack754_64(m_pos.y));
+
+        i.WriteU64(mpack754_64(m_vel.x));
+        i.WriteU64(mpack754_64(m_vel.y));
+
+}
+
+uint32_t AntMofoHelloHeader::Deserialize(Buffer::Iterator start) {
+        Buffer::Iterator i = start;
+        uint32_t length = i.ReadU32();
+        uint8_t buf[length];
+        i.Read(buf, length);
+        m_eid = BundleEndpointId::Deserialize(buf);
+
+        uint32_t size = i.ReadU32();
+        //NS_LOG_DEBUG("size=" << size);
+        for (uint32_t j = 0; j < size; j++) {
+                /*uint32_t eid_ = i.ReadU32();*/
+
+                uint32_t length2 = i.ReadU32();
+                uint8_t buf2[length2];
+                i.Read(buf2, length2);
+                BundleEndpointId eid_ = BundleEndpointId::Deserialize(buf2);
+                //NS_LOG_DEBUG("eid = " << eid_ << " - p = " << p_ );
+                m_nlist.push_back(eid_);
+        }
+
+
+        m_pos.x = munpack754_64(i.ReadU64());
+        m_pos.y = munpack754_64(i.ReadU64());
+
+        m_vel.x = munpack754_64(i.ReadU64());
+        m_vel.y = munpack754_64(i.ReadU64());
+
+        return GetSerializedSize();
+}
+
+void
+AntMofoHelloHeader::SetBundleEndpointId (BundleEndpointId eid)
+{
+  m_eid = eid;
+}
+
+BundleEndpointId
+AntMofoHelloHeader::GetBundleEndpointId () const
+{
+  return m_eid;
+}
+
+void AntMofoHelloHeader::setPos(double x, double y) {
+        m_pos.x = x;
+        m_pos.y = y;
+}
+
+void AntMofoHelloHeader::setVel(double x, double y) {
+        m_vel.x = x;
+        m_vel.y = y;
+}
+
+Vector2d AntMofoHelloHeader::getPos() const {
+        return m_pos;
+}
+
+Vector2d AntMofoHelloHeader::getVel() const{
+        return m_vel;
+}
+
+
+}
+}

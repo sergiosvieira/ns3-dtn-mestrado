@@ -1,0 +1,29 @@
+Use:
+./waf --run "aodv-test --st=timeSimulation --ss=seed --pt=protocol --ce=mobility.tcl --tr=traficOne --nn=numberNodes"
+./waf --run "aodv-test-buff --st=timeSimulation --ss=seed --pt=protocol --ce=mobility.tcl --tr=traficOne --nn=numberNodes --buff=numbermaxBundleBuffer"
+
+change the file regular-wifi-mac.cc:
+to
+void
+RegularWifiMac::TxOk (const WifiMacHeader &hdr)
+{
+  NS_LOG_FUNCTION (this << hdr);
+  m_txOkCallback (hdr);
+  if (!(hdr.GetAddr1 () == Mac48Address::GetBroadcast ()))
+    {
+      if (!m_DTNtxOkCallback.IsNull ())
+        {
+          m_DTNtxOkCallback ();
+        }
+    }
+}
+
+put this:
+
+void
+RegularWifiMac::SetTxCallbacks (Callback<void> DTNtxOkCallback, Callback<void> DTNtxFailedCallback)
+{
+  m_DTNtxOkCallback = DTNtxOkCallback;
+  m_DTNtxFailedCallback = DTNtxFailedCallback;
+}
+

@@ -1,0 +1,17 @@
+K 25
+svn:wc:ra_dav:version-url
+V 55
+/svn/dtn-ns3.16/!svn/ver/35/ns-3.16/src/bundle-protocol
+END
+saida.txt
+K 25
+svn:wc:ra_dav:version-url
+V 64
+/svn/dtn-ns3.16/!svn/ver/8/ns-3.16/src/bundle-protocol/saida.txt
+END
+wscript
+K 25
+svn:wc:ra_dav:version-url
+V 63
+/svn/dtn-ns3.16/!svn/ver/10/ns-3.16/src/bundle-protocol/wscript
+END

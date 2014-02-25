@@ -1,0 +1,812 @@
+/*
+ * Author: João Gonçalves
+ * Larces - Laboratório de Redes de Computadores  - 2012
+ * Spray-And-Wait utilizando a tendência de entrega
+ */
+
+
+#include <cmath>
+#include <algorithm>
+#include <limits>
+#include <sstream>
+#include "ns3/log.h"
+#include "ns3/uinteger.h"
+#include "ns3/address.h"
+#include "ns3/mac48-address.h"
+#include "ns3/mobility-model.h"
+#include "ns3/trace-source-accessor.h"
+#include "ns3/nstime.h"
+#include "ns3/boolean.h"
+#include "bp-rt-epidemic.h"
+#include "bp-header.h"
+#include "bp-contact.h"
+#include "bp-link-manager.h"
+#include "bp-neighbourhood-detection-agent.h"
+#include "bp-rt-trend-of-spray.h"
+#include "bp-rt-trend-of-delivery-neigh-hello.h"
+
+NS_LOG_COMPONENT_DEFINE ("RTTrendOfSpray");
+
+static const double EPSILON = 0.1;
+//static Vector2d destination(1500.0, 500.0);
+
+namespace ns3 {
+namespace bundleProtocol {
+
+NS_OBJECT_ENSURE_REGISTERED (RTTrendOfSpray);
+
+TypeId RTTrendOfSpray::GetTypeId(void) {
+        static TypeId tid = TypeId ("ns3::bundleProtocol::RTTrendOfSpray")
+                .SetParent<BundleRouter> ()
+                .AddConstructor<RTTrendOfSpray> ()
+                .AddAttribute ("AlwaysSendHello",
+                                "Sets if the router always should send hellos or only when it have something to send.",
+                                BooleanValue (true),
+                                MakeBooleanAccessor (&RTTrendOfSpray::m_alwaysSendHello),
+                                MakeBooleanChecker ())
+                .AddTraceSource ("RedundantRelay", "A message already held in the buffer has been received.",
+                                MakeTraceSourceAccessor (&RTTrendOfSpray::m_redundantRelayLogger));
+
+        return tid;
+}
+
+RTTrendOfSpray::RTTrendOfSpray() : BundleRouter(), m_send_timer((Timer::CANCEL_ON_DESTROY))
+{
+        m_transmissionRange = 300.0;
+	/*Posições dos destinos*/
+        destinations[4].x = 600;
+        			    destinations[4].y = 2000;
+        				destinations[5].x = 1200;
+        				destinations[5].y = 2000;
+        				destinations[6].x = 600;
+        				destinations[6].y = 800;
+        				destinations[7].x = 1200;
+        				destinations[7].y = 800;
+
+
+
+}
+
+RTTrendOfSpray::~RTTrendOfSpray()
+{
+}
+
+void RTTrendOfSpray::DoInit()
+{
+        if (m_alwaysSendHello) {
+                m_nda->Start();
+        }
+}
+
+void RTTrendOfSpray::DoDispose()
+{
+        BundleRouter::DoDispose();
+}
+
+void RTTrendOfSpray::DoLinkClosed(Ptr<Link> link)
+{
+        if (link->GetContact() != 0) {
+                BundleList bundles = link->GetContact()->GetQueuedBundles();
+                for (BundleList::iterator iter = bundles.begin(); iter != bundles.end(); ++iter) {
+                        link->GetContact()->DequeueBundle(*iter);
+                        CancelTransmission(*iter, link);
+                }
+        }
+
+        RemoveRouterSpecificBundles(link);
+}
+
+void RTTrendOfSpray::RemoveRouterSpecificBundles(Ptr<Link> link)
+{
+}
+
+void RTTrendOfSpray::PauseLink(Ptr<Link> link)
+{
+        if (link->GetState() == LINK_CONNECTED) {
+                BundleList bundles = link->GetContact()->GetQueuedBundles();
+
+                for (BundleList::iterator iter = bundles.begin(); iter != bundles.end(); ++iter) {
+                        link->GetContact()->DequeueBundle(*iter);
+                        CancelTransmission(*iter, link);
+                }
+
+                link->ChangeState(LINK_PAUSED);
+
+                Ptr<Contact> c = link->GetContact();
+
+                if (c->GetRetransmissions() >= m_maxRetries) {
+                        m_linkManager->CloseLink(link);
+                } else {
+                        c->IncreaseRetransmissions();
+                        Simulator::Schedule(m_pauseTime,
+                                        &RTTrendOfSpray::UnPauseLink, this, link);
+                }
+        }
+        Simulator::ScheduleNow(&RTTrendOfSpray::TryToStartSending, this);
+}
+
+void RTTrendOfSpray::UnPauseLink(Ptr<Link> link)
+{
+        if (link->GetState() == LINK_PAUSED) {
+                link->ChangeState(LINK_CONNECTED);
+                Simulator::ScheduleNow(&RTTrendOfSpray::TryToStartSending, this);
+        }
+}
+
+void RTTrendOfSpray::DoLinkDiscovered(Ptr<Link> link)
+{
+        m_linkManager->OpenLink(link);
+        Simulator::ScheduleNow(&RTTrendOfSpray::TryToStartSending, this);
+}
+
+void RTTrendOfSpray::DoBundleReceived(Ptr<Bundle> bundle)
+{
+
+        SetBundleReceived("RTTrendOfSpray.out",bundle);
+        Ptr<Link> link = m_linkManager->FindLink(
+                        bundle->GetReceivedFrom().front().GetEndpoint());
+        if (link != 0) {
+                link->UpdateLastHeardFrom();
+        }
+}
+
+Ptr<Bundle> RTTrendOfSpray::DoSendBundle(Ptr<Link> link, Ptr<Bundle> bundle)
+{
+        if(link->GetContact())
+        {
+          link->GetContact()->EnqueueBundle(bundle);
+        }
+        bundle->SetReplicationFactor(bundle->GetReplicationFactor()/2);/*Fica com Metade das Cópias
+        Quando o numero de copias é igual a 1, o protocolo entra no modo wait, ou seja ele vai repassar
+        a copia agora apenas para o Nó Destino*/
+        //bundle->SetReplicationFactor(0);
+        Ptr<Bundle> send = bundle->Copy();
+        send->SetLifetime(200);
+        return send;
+}
+
+void RTTrendOfSpray::DoBundleSent(const Address& address,
+                const GlobalBundleIdentifier& gbid, bool finalDelivery)
+{
+        Mac48Address mac = Mac48Address::ConvertFrom(address);
+        Ptr<Link> link = m_linkManager->FindLink(mac);
+
+        Ptr<Bundle> bundle = GetBundle(gbid);
+        if (bundle != 0) {
+                // I have received an ack for the sent bundle, so i have heard from the
+                // other node.
+                link->UpdateLastHeardFrom();
+
+                if (link->GetState() == LINK_CONNECTED || link->GetState()
+                                == LINK_PAUSED) {
+                        link->GetContact()->DequeueBundle(gbid);
+                        link->GetContact()->ResetRetransmissions();
+                }
+
+                m_forwardLog.AddEntry(bundle, link);
+
+                if (finalDelivery) {
+                        BundleDelivered(bundle, true);
+                }
+
+                Simulator::ScheduleNow(&RTTrendOfSpray::TryToStartSending, this);
+        } else {
+                if (finalDelivery) {
+                        // This is a ugly hack utilitzing the fact that i know that
+                        // the ttl is "inifinite".
+                        Ptr<Bundle> bundle = Create<Bundle> ();
+                        bundle->SetSourceEndpoint(gbid.GetSourceEid());
+                        bundle->SetCreationTimestamp(gbid.GetCreationTimestamp());
+                        bundle->SetLifetime(43000);
+                        BundleDelivered(bundle, true);
+
+                        Simulator::ScheduleNow(&RTTrendOfSpray::TryToStartSending, this);
+                }
+        }
+}
+
+void RTTrendOfSpray::DoBundleTransmissionFailed(const Address& address,
+                const GlobalBundleIdentifier& gbid)
+{
+        Mac48Address mac = Mac48Address::ConvertFrom(address);
+        Ptr<Link> link = m_linkManager->FindLink(mac);
+        PauseLink(link);
+}
+
+bool RTTrendOfSpray::DoAcceptBundle(Ptr<Bundle> bundle,
+                bool fromApplication)
+{
+        if (HasBundle(bundle)) {
+                m_redundantRelayLogger(bundle);
+                Ptr<Bundle> otherBundle = GetBundle(bundle->GetBundleId());
+                otherBundle->AddReceivedFrom(bundle->GetReceivedFrom().front());
+            	if(bundle->IsCustodyTransferRequested())
+            	{
+            		Ptr<Link> link = GetLinkManager()->FindLink(bundle->GetCustodianEndpoint());
+            		if(link)
+            		{
+            			Ptr<Bundle> bundleS = bundle->Copy();//GenerateBundle (Create<Packet> (1), bundle->GetCustodianEndpoint(), bundleProtocol::EXPEDITED,Seconds(100), bundleProtocol::PrimaryProcessingControlFlags ());
+            			bundleS->SetReportCustodyAcceptance(true);
+            			bundleS->SetReplicationFactor(20);
+            			bundleS->SetCustody(bundle->GetBundleId());
+            			SendBundle(link,bundleS);
+            		}
+            	}
+                return false;
+        }
+        return CanMakeRoomForBundle(bundle);
+}
+
+bool RTTrendOfSpray::DoCanDeleteBundle(const GlobalBundleIdentifier& gbid)
+{
+        return true;
+}
+
+void RTTrendOfSpray::DoInsert(Ptr<Bundle> bundle)
+{
+        // This is my extra thing, i always set the eid to current node holding the bundle.
+        bundle->SetCustodianEndpoint(m_eid);
+
+        m_bundleList.push_back(bundle);
+
+        // If this is the first bundle, I now want to begin sending hello messages announcing that
+        // I have something to send. If there is more than one bundle in the queue this means that
+        // I already have started sending hello messages.
+        if (m_nBundles == 1 && !m_alwaysSendHello) {
+                m_nda->Start();
+        }
+
+        Simulator::ScheduleNow(&RTTrendOfSpray::TryToStartSending, this);
+}
+
+bool RTTrendOfSpray::CanMakeRoomForBundle(Ptr<Bundle> bundle)
+{
+        if (bundle->GetSize() < m_maxBytes) {
+                return true;
+        } else {
+                return false;
+        }
+
+}
+
+bool RTTrendOfSpray::MakeRoomForBundle(Ptr<Bundle> bundle)
+{
+        if (bundle->GetSize() < m_maxBytes) {
+                if (bundle->GetSize() < GetFreeBytes()) {
+                        return true;
+                }
+
+                //for (BundleList::reverse_iterator iter = m_bundleList.rbegin(); iter
+                               // != m_bundleList.rend();) {
+                BundleList::iterator ite = m_bundleList.begin();
+                Ptr<Bundle> forDeletion = *(ite);
+
+                for (BundleList::iterator iter = m_bundleList.begin(); iter
+                                                != m_bundleList.end();) {
+                	Ptr<Bundle> currentBundle = *(iter++);
+                	if(forDeletion->GetReplicationFactor() > currentBundle->GetReplicationFactor() ){
+                		forDeletion = currentBundle;
+                	}
+                }
+                if(forDeletion)
+                {
+                	DeleteBundle(forDeletion, false);
+                }
+				if (bundle->GetSize() < GetFreeBytes()) {
+						return true;
+				}
+        }
+        SetBufferOverFlow("RTTrendOfSpray.buff");
+        return false;
+}
+
+bool RTTrendOfSpray::DoDelete(const GlobalBundleIdentifier& gbid,
+                bool drop)
+{
+        // If this is the last bundle in the queue, stop sending Hello messages.
+
+        if (m_nBundles == 1 && !m_alwaysSendHello) {
+                //m_nda->Stop();
+        }
+
+        if (drop)/*drop = true indica que o bundle expirou por isso está sendo apagado*/
+        {
+                 SetBundleExpired("RTTrendOfSpray.expired");
+        }
+        return BundleRouter::DoDelete(gbid, drop);
+}
+
+void RTTrendOfSpray::DoCancelTransmission(Ptr<Bundle> bundle,
+                Ptr<Link> link)
+{
+}
+
+void RTTrendOfSpray::DoTransmissionCancelled(const Address& address,
+                const GlobalBundleIdentifier& gbid)
+{
+        Mac48Address mac = Mac48Address::ConvertFrom(address);
+        Ptr<Link> link = m_linkManager->FindLink(mac);
+        if(link->GetContact())
+        {
+            link->GetContact()->DequeueBundle(gbid);
+        }
+        Simulator::ScheduleNow(&RTTrendOfSpray::TryToStartSending, this);
+}
+
+bool RTTrendOfSpray::IsDirectLink(Ptr <Link> link, Ptr <Bundle> bundle)
+{
+        if (link->GetRemoteEndpointId()== bundle->GetDestinationEndpoint())
+        {
+                return true;
+        }
+        return false;
+}
+
+void RTTrendOfSpray::TryToStartSending() {
+    //NS_LOG_DEBUG("(" << m_node->GetId () << ")");
+     RemoveExpiredBundles(true);
+     m_forwardLog.RemoveExpiredEntries();
+
+     if (!IsSending() && (GetNBundles() > 0)) {
+             LinkBundle linkBundle = FindNextToSend();
+
+             if (!linkBundle.IsNull()) {
+                     Ptr<Link> link_ = linkBundle.GetLink();
+                     //Essa setagem agora é feita de acordo com a tendencia de entrega
+         			//linkBundle.GetBundle()->SetCustodyTransferRequested(false);
+                     if(linkBundle.GetBundle()->IsCustodyTransferRequested())
+                     {
+							NS_LOG_DEBUG("(" << m_node->GetId() << ") transfer to ");
+
+							/*Inseri na lista de pacotes que trasnferiram custodia, serve para que ele nao receba novamente o mesmo pacote*/
+							InsertCustodyHistorical(linkBundle.GetBundle()->GetBundleId());
+							/*Inseri na lista de pacotes que trasnferiram custodia, mas ainda não esperaram resposta*/
+							InsertCustodyHistoricalPending(linkBundle.GetBundle()->GetBundleId());
+							Simulator::Schedule (Seconds(5.0), &RTTrendOfSpray::EraseCustodyHistoricalPending,this,linkBundle.GetBundle()->GetBundleId());
+                     }
+                     else
+                     {
+             			linkBundle.GetBundle()->AddReceivedFrom(linkBundle.GetLink()->GetRemoteEndpointId().GetId());
+                     }
+                     SendBundle(linkBundle.GetLink(), linkBundle.GetBundle());
+             } else {
+                     Simulator::Schedule(Seconds(1.0),
+                                     &RTTrendOfSpray::TryToStartSending, this);
+             }
+     }
+}
+
+LinkBundle RTTrendOfSpray::FindNextToSend()
+{
+        //NS_LOG_DEBUG("RTTrendOfSpray::FindNextToSend");
+        //NS_LOG_DEBUG("(" << m_node->GetId() << ") - m_linkManager->GetConnectedLinks().size()= " << m_linkManager->GetConnectedLinks().size() << " GetNBundles() = " << GetNBundles() );
+        if ((m_linkManager->GetConnectedLinks().size() > 0) && (GetNBundles() > 0)) {
+                LinkBundleList linkBundleList = GetAllDeliverableBundles();
+                //printLinkBundleList(linkBundleList);
+                //printTable();
+                if (!linkBundleList.empty()) {
+
+			NS_LOG_DEBUG("(" << m_node->GetId() << ")" <<"Lista Com Bundles");
+                        return getBestLink(linkBundleList);
+                }
+		else
+		{
+			NS_LOG_DEBUG("(" << m_node->GetId() << ")" <<"Lista Vazia");
+		}
+        }
+        return LinkBundle(0, 0);
+}
+
+LinkBundle RTTrendOfSpray::getBestLink(LinkBundleList lbl) {
+        LinkBundle result = lbl[0];// = lbl.front();
+        uint32_t l = 0;
+		for (unsigned int i = 0 ; i < lbl.size(); i++){
+			if(IsDirectLink(lbl[i].GetLink(), lbl[i].GetBundle())){
+				result = lbl[i];
+				return lbl[i];
+			}
+			if(lbl[i].GetBundle()->GetReplicationFactor() > l){
+				l = lbl[i].GetBundle()->GetReplicationFactor();
+				result = lbl[i];
+			}
+
+		}
+        bool r = IsDirectLink(result.GetLink(), result.GetBundle());
+        if (r == true) {
+		result.GetBundle()->SetCustodyTransferRequested(true);
+                return result;
+        }
+        printTable();
+        removeExpiredNeighs();
+        BundleEndpointId eid = GetBundleEndpointId();
+        double my_tod = getFuzzy(eid,result.GetBundle()->GetDestinationEndpoint().GetId());
+	double best_tod = -111;
+
+
+
+        //NS_LOG_DEBUG("(" << m_node->GetId() << ") eid = " << eid << " best tod = " << best_tod);
+
+        //printTable();
+
+        for (std::map<BundleEndpointId, TrendOfDeliveryTable>::iterator it =
+                        m_table.begin(); it != m_table.end(); ++it) {
+
+                double tod = getFuzzy((*it).first,result.GetBundle()->GetDestinationEndpoint().GetId());
+                //NS_LOG_DEBUG("(" << m_node->GetId() << ") it eid = " << (*it).first << " it tod = " << tod);
+                if (tod > best_tod && (*it).second.m_expTime > Simulator::Now() && GetLinkManager()->FindLink((*it).first)) {
+                        //NS_LOG_DEBUG("(" << m_node->GetId() << ") BEST");
+                        best_tod = tod;
+                        eid = (*it).first;
+                }
+        }
+	NS_LOG_DEBUG("(" << m_node->GetId() << ") eid = " << eid << " best tod = " << best_tod);
+        if(my_tod > best_tod){ //(eid.GetId() == GetBundleEndpointId().GetId()) {
+                //NS_LOG_DEBUG("(" << m_node->GetId() << ") Do not copy!");
+        	NS_LOG_DEBUG("(" << m_node->GetId() << ") keep to " << eid);
+		return LinkBundle(0,0);/*Mantém consigo*/
+        	//result.GetBundle()->SetCustodyTransferRequested(false);
+        	//return result;
+        } else {
+		/*Caso 1*/
+		if(best_tod > 0.5 && my_tod > 0.5 )
+		{
+			result.GetBundle()->SetCustodyTransferRequested(true);/*Encaminha*/
+		}/*Caso 2*/
+		else if(best_tod <= 0.5 && my_tod <= 0.5)
+		{
+			//result.GetBundle()->SetCustodyTransferRequested(true);/*Encaminha*/
+			if(result.GetBundle()->GetReplicationFactor() > 1)
+			{
+				result.GetBundle()->SetCustodyTransferRequested(false);/*Copia*/
+			}
+			else /*Não há mais cópias para o Bundle*/
+			{
+				return LinkBundle(0,0);
+			}
+		}/*Caso 3*/
+		else if(best_tod > 0.5 && my_tod <= 0.5)
+		{
+			//result.GetBundle()->SetCustodyTransferRequested(true);/*Encaminha*/
+			result.GetBundle()->SetCustodyTransferRequested(true);/*Encaminha*/
+
+
+		}
+
+                //result.GetBundle()->SetCustodyTransferRequested(true);
+        }
+
+
+
+        return LinkBundle(GetLinkManager()->FindLink(eid), result.GetBundle());
+}
+
+void RTTrendOfSpray::printLinkBundleList(LinkBundleList lbl) {
+        deque<LinkBundle>::iterator it;
+        for (it = lbl.begin(); it != lbl.end(); ++it) {
+                NS_LOG_DEBUG("(" << m_node->GetId() << ") Link = " << (*it).GetLink()->GetRemoteEndpointId() << " Bundle = " << (*it).GetBundle()->GetBundleId());
+        }
+}
+LinkBundle RTTrendOfSpray::GetNextRouterSpecific()
+{
+        return LinkBundle(0, 0);
+}
+
+LinkBundleList RTTrendOfSpray::GetAllDeliverableBundles()
+{
+        Links links = m_linkManager->GetConnectedLinks();
+        LinkBundleList result;
+        for (Links::iterator iter = links.begin(); iter != links.end(); ++iter) {
+                Ptr<Link> link = *iter;
+                LinkBundleList linkBundleList = GetAllBundlesForLink(link);
+                result.insert(result.end(), linkBundleList.begin(),     linkBundleList.end());
+        }
+        return result;
+}
+
+LinkBundleList RTTrendOfSpray::GetAllBundlesForLink(Ptr<Link> link)
+{
+	LinkBundleList linkBundleList;
+	LinkBundleList direct;
+	if (link->GetState() == LINK_CONNECTED) {
+			if (link->GetState() == LINK_CONNECTED) {
+					for (BundleList::iterator iter = m_bundleList.begin(); iter
+									!= m_bundleList.end(); ++iter) {
+							Ptr<Bundle> bundle = *iter;
+							/*
+							if (bundle->HasRetentionConstraint(RC_FORWARDING_PENDING)
+											&& !bundle->HaveBeenReceivedFrom(link)
+											&& (link->GetRemoteEndpointId()
+															== bundle->GetDestinationEndpoint())
+											&& !m_forwardLog.HasEntry(bundle, link)) {
+									linkBundleList.push_back(LinkBundle(link, *iter));
+							}
+							*/
+							/* agora não tem mais restrição de EID - virou epidêmico */
+							if(!bundle->HaveBeenReceivedFrom(link->GetRemoteEndpointId().GetId()) && link->GetRemoteEndpointId() == bundle->GetDestinationEndpoint()){
+								direct.push_back(LinkBundle(link,*iter));
+								return direct;
+							}
+							else if (!bundle->HaveBeenReceivedFrom(link)
+											&& !m_forwardLog.HasEntry(bundle, link)
+											&& !isBundleCustodyPending(bundle->GetBundleId())) {
+									linkBundleList.push_back(LinkBundle(link, *iter));
+									//linkBundleList.addNode(LinkBundle(link, *iter));
+							}
+
+					}
+			}
+	}
+	return linkBundleList;
+}
+
+uint8_t RTTrendOfSpray::DoCalculateReplicationFactor(
+                const BundlePriority& priority) const
+{
+        return 1;
+}
+
+bool RTTrendOfSpray::DoIsRouterSpecific(Ptr<Bundle> bundle)
+{
+        return false;
+}
+
+bool RTTrendOfSpray::DoIsRouterSpecific(const BlockType& block)
+{
+        return false;
+}
+
+void RTTrendOfSpray::SendRouterSpecific(Ptr<Link> link,
+                Ptr<Bundle> bundle)
+{
+}
+
+void RTTrendOfSpray::SentRouterSpecific(Ptr<Link> link,
+                const GlobalBundleIdentifier& gbid)
+{
+}
+
+void RTTrendOfSpray::ReceiveRouterSpecific(Ptr<Bundle> bundle)
+{
+}
+
+void RTTrendOfSpray::AddRouterSpecificBundle(Ptr<Bundle> bundle)
+{
+}
+
+void RTTrendOfSpray::RemoveRouterSpecificBundle(
+                const GlobalBundleIdentifier& gbid, uint8_t reason)
+{
+}
+
+bool RTTrendOfSpray::HasRouterSpecificBundle(
+                const GlobalBundleIdentifier& gbid)
+{
+        return false;
+}
+
+Ptr<Bundle> RTTrendOfSpray::GetRouterSpecificBundle(
+                const GlobalBundleIdentifier& gbid)
+{
+        return Create<Bundle> ();
+}
+
+void RTTrendOfSpray::DoBundleDelivered(Ptr<Bundle> bundle, bool fromAck) {
+        NS_LOG_DEBUG("(" << m_node->GetId() << ") - From = " << bundle->GetCustodianEndpoint() << " - fromAck = " << fromAck);
+
+        m_kdm.Insert(bundle);
+
+        BundleList bl;
+        for (BundleList::iterator iter = m_bundleList.begin(); iter != m_bundleList.end(); ++iter) {
+                NS_LOG_DEBUG("--> BUNDLE EID: " << (*iter)->GetCustodianEndpoint());
+                Ptr<Bundle> bundle = *iter;
+                if (m_kdm.Has(bundle)) {
+                        bl.push_back(bundle);
+                        m_forwardLog.RemoveEntriesFor(bundle->GetBundleId());
+                }
+        }
+
+        for (BundleList::iterator iter = bl.begin(); iter != bl.end(); ++iter) {
+                NS_LOG_DEBUG("--> Delivered EID: " << (*iter)->GetBundleId());
+                DeleteBundle(*iter, false);
+        }
+}
+
+Ptr<Link> RTTrendOfSpray::DoCreateLink(const BundleEndpointId& eid, const Address& address)
+{
+        //NS_LOG_DEBUG ("(" << m_node->GetId () << ") "  << "RTTrendOfSpray::DoCreateLink");
+        Ptr<ConvergenceLayerAgent> cla = m_node->GetObject<BundleProtocolAgent>()->GetConvergenceLayerAgent();
+        Ptr<Link> link = CreateObject<Link> ();
+
+        link->SetLinkLostCallback(MakeCallback(&ConvergenceLayerAgent::LinkLost, cla));
+
+        link->SetRemoteEndpointId(eid);
+        link->SetRemoteAddress(address);
+
+        return link;
+}
+
+
+
+/*sergioviera*/
+void RTTrendOfSpray::DoSendHello(Ptr<Socket> socket, BundleEndpointId eid)
+{
+	if(Simulator::Now ().GetSeconds () > curTime - 10)
+	{
+		m_nda->Stop();
+		while(!m_bundleList.empty()){m_bundleList.pop_front();}
+	}
+
+        else if (IsTimeToSend()) {
+                NS_LOG_DEBUG("(" << m_node->GetId() << ") - AID It's time to send...");
+                DoNeighCalc();
+                SendNeighHello(socket, eid);
+        }
+}
+
+bool RTTrendOfSpray::IsTimeToSend() {
+        if (m_flag) {
+                m_flag = false;
+                return true;
+        } else {
+                if (Simulator::Now().GetSeconds() > m_nextTimeToSend.GetSeconds()) {
+                        //NS_LOG_DEBUG("(" << m_node->GetId() << ") - AID m_nextTimeToSend = " << m_nextTimeToSend.GetSeconds());
+                        return true;
+                } else if (Simulator::Now().GetSeconds() > m_nextCheckPointTimer.GetSeconds()) {
+                        //NS_LOG_DEBUG("(" << m_node->GetId() << ") - AID m_nextCheckPointTimer = " << m_nextCheckPointTimer.GetSeconds());
+                        Ptr<MobilityModel> mobilityModel = m_node->GetObject<MobilityModel> ();
+                        Vector2d myPosition = Vector2d(mobilityModel->GetPosition().x, mobilityModel->GetPosition().y);
+                        //Vector2d myVelocity = Vector2d(mobilityModel->GetVelocity().x, mobilityModel->GetVelocity().y);
+                        Vector2d myPredictedPosition = CalcMyPredictedPosition(Simulator::Now().GetSeconds() - m_myLastTime.GetSeconds());
+
+                        m_nextCheckPointTimer = m_nextCheckPointTimer + m_lastCheckoutInterval;
+                        if ((myPosition - myPredictedPosition).length() > EPSILON) {
+                                //NS_LOG_DEBUG("(" << m_node->GetId() << ") - AID > ");
+                                return true;
+                        } else {
+                                //NS_LOG_DEBUG("(" << m_node->GetId() << ") - AID <= ");
+                                return false;
+                        }
+
+                } else {
+                        return false;
+                }
+        }
+}
+
+Vector2d RTTrendOfSpray::CalcMyPredictedPosition(double time) {
+        Vector2d result;
+        result.x = m_myLastPosition.x + m_myLastVelocity.x * time;
+        result.y = m_myLastPosition.y + m_myLastVelocity.y * time;
+        return result;
+}
+
+void RTTrendOfSpray::DoNeighCalc() {
+        Ptr<MobilityModel> mobilityModel = m_node->GetObject<MobilityModel> ();
+        m_myLastPosition = Vector2d(mobilityModel->GetPosition().x, mobilityModel->GetPosition().y);
+        m_myLastVelocity = Vector2d(mobilityModel->GetVelocity().x, mobilityModel->GetVelocity().y);
+        m_myLastTime = Simulator::Now();
+
+        if (m_myLastVelocity.length() >= 1.000) {
+                double length = m_myLastVelocity.length();
+                double tmp = m_transmissionRange / length;
+                Time interval = Time::FromDouble(tmp, Time::S);
+                m_lastCheckoutInterval = Seconds(interval.GetSeconds() / 7.0);
+                m_nextTimeToSend = m_myLastTime + interval;
+                m_nextCheckPointTimer = m_myLastTime + m_lastCheckoutInterval;
+        } else {
+                //NS_LOG_DEBUG("(" << m_node->GetId() << ") Velocity < 1.0");
+                Time interval = Seconds(2.0);
+                m_lastCheckoutInterval = Seconds(interval.GetSeconds() / 7.0);
+                m_nextTimeToSend = m_myLastTime + interval;
+                m_nextCheckPointTimer = m_myLastTime + m_lastCheckoutInterval;
+        }
+}
+
+
+void RTTrendOfSpray::SendNeighHello(Ptr<Socket> socket, BundleEndpointId eid) {
+        //NS_LOG_DEBUG("(" << m_node->GetId() << ")");
+        Ptr<MobilityModel> mobilityModel = m_node->GetObject<MobilityModel> ();
+
+        NeighHello header; /*É o mesmo header do trend-of-delivery*/
+        header.SetBundleEndpointId(eid);
+        header.setPos(mobilityModel->GetPosition().x, mobilityModel->GetPosition().y);
+        header.setVel(mobilityModel->GetVelocity().x, mobilityModel->GetVelocity().y);
+        header.setTimeStamp(Simulator::Now());
+
+//        NS_LOG_DEBUG("(" << m_node->GetId() << ") "<< header);
+
+        Ptr<Packet> hello = Create<Packet> ();
+        TypeTag type(2);
+        hello->AddPacketTag(type);
+        hello->AddHeader(header);
+        socket->Send(hello);
+
+}
+
+void RTTrendOfSpray::DoHandleHello(Ptr<Socket> socket)
+{
+        Ptr<Packet> receivedHello;
+        Address fromAddress;
+
+        receivedHello = socket->RecvFrom(fromAddress);
+        NeighHello header;
+        receivedHello->PeekHeader(header);
+
+        NS_LOG_DEBUG ("(" << m_node->GetId () << ") - Received Message = " << header);
+
+        addNeigh(header);
+        //printTable();
+
+        Simulator::ScheduleNow(&NeighbourhoodDetectionAgent::NotifyDiscoveredLink,
+                        m_nda, receivedHello, fromAddress);
+}
+
+void RTTrendOfSpray::addNeigh(const NeighHello& header) {
+        Ptr<MobilityModel> mobilityModel = m_node->GetObject<MobilityModel> ();
+        Vector2d myPosition = Vector2d(mobilityModel->GetPosition().x,  mobilityModel->GetPosition().y);
+        Vector2d myVelocity = Vector2d(mobilityModel->GetVelocity().x,  mobilityModel->GetVelocity().y);
+
+        TrendOfDeliveryTable tmp;
+        tmp.m_expTime = LinkLifeTime::getExpirationTime(myPosition, myVelocity, header.getPos(), header.getVel(), m_transmissionRange);
+        tmp.m_timeStamp = header.getTimeStamp();
+        tmp.m_pos = header.getPos();
+        tmp.m_vel = header.getVel();
+        m_table[header.GetBundleEndpointId()] = tmp;
+}
+
+void RTTrendOfSpray::printTable() {
+        NS_LOG_DEBUG("Neigh Table (" << m_node->GetId() << ")");
+        NS_LOG_DEBUG("Neigh\tExp. Time\tTime Stamp\tPosition\tVelocity\tTOD");
+        NS_LOG_DEBUG("--------------------------------------------------------------------------------");
+        for (std::map<BundleEndpointId, TrendOfDeliveryTable>::iterator it = m_table.begin(); it != m_table.end(); ++it) {
+        	NS_LOG_DEBUG((*it).first << "\t" << (*it).second.m_expTime.GetSeconds() << "\t\t" << (*it).second.m_timeStamp.GetSeconds() << "\t\t" << (*it).second.m_pos << "\t" << (*it).second.m_vel << "\t\t" << getFuzzy((*it).first,3));
+			NS_LOG_DEBUG((*it).first << "\t" << (*it).second.m_expTime.GetSeconds() << "\t\t" << (*it).second.m_timeStamp.GetSeconds() << "\t\t" << (*it).second.m_pos << "\t" << (*it).second.m_vel << "\t\t" << getFuzzy((*it).first,4));
+			NS_LOG_DEBUG((*it).first << "\t" << (*it).second.m_expTime.GetSeconds() << "\t\t" << (*it).second.m_timeStamp.GetSeconds() << "\t\t" << (*it).second.m_pos << "\t" << (*it).second.m_vel << "\t\t" << getFuzzy((*it).first,5));
+			NS_LOG_DEBUG((*it).first << "\t" << (*it).second.m_expTime.GetSeconds() << "\t\t" << (*it).second.m_timeStamp.GetSeconds() << "\t\t" << (*it).second.m_pos << "\t" << (*it).second.m_vel << "\t\t" << getFuzzy((*it).first,6));
+			NS_LOG_DEBUG((*it).first << "\t" << (*it).second.m_expTime.GetSeconds() << "\t\t" << (*it).second.m_timeStamp.GetSeconds() << "\t\t" << (*it).second.m_pos << "\t" << (*it).second.m_vel << "\t\t" << getFuzzy((*it).first,8));
+        }
+        //NS_LOG_DEBUG("");
+}
+
+void RTTrendOfSpray::removeExpiredNeighs() {
+        for (std::map<BundleEndpointId, TrendOfDeliveryTable>::iterator it = m_table.begin(); it != m_table.end();) {
+                if (Simulator::Now().GetSeconds() > (*it).second.m_expTime.GetSeconds()) {
+                        NS_LOG_DEBUG("(" << m_node->GetId() << ") Delete " << (*it).first);
+                        std::map<BundleEndpointId, TrendOfDeliveryTable>::iterator toErase = it;
+                        ++it;
+                        m_table.erase(toErase);
+                }
+                else
+                {
+                	++it;
+                }
+        }
+}
+
+double RTTrendOfSpray::getFuzzy(BundleEndpointId eid,uint32_t id) {
+	double result = 0.0;
+
+	        Vector2d my_pos_, my_vel_;
+
+	        double now_ = Simulator::Now().GetSeconds();
+
+	        my_pos_.x = m_table[eid].m_pos.x + m_table[eid].m_vel.x * (now_ - m_table[eid].m_timeStamp.GetSeconds() + 2.0);
+	        my_pos_.y = m_table[eid].m_pos.y + m_table[eid].m_vel.y * (now_ - m_table[eid].m_timeStamp.GetSeconds() + 2.0);
+
+	        my_vel_ = m_table[eid].m_vel;
+
+	        m_tod.setFuzzy(my_pos_, destinations[id], m_transmissionRange);
+
+	        Vector2d w = destinations[id] - my_pos_;
+	        double theta_vel = w.angle(my_vel_);
+
+		NS_LOG_DEBUG("(" << eid << ")" <<" velK:" << my_vel_.length());
+	        m_tod.inference(theta_vel, w.length(), my_vel_.length(), &result);
+
+	        return result;
+}
+
+/*sergioviera*/
+
+}
+} // namespace bundleProtocol, ns3

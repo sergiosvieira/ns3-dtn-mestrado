@@ -1,0 +1,559 @@
+/*
+ * bp-rt-sprayandwait.cc
+ *
+ *  Created on: 14/05/2012
+ *  Author: João Gonçalves
+ *  Laboratório de Redes e Segurança (LARCES)
+ */
+
+
+#include <cmath>
+#include <algorithm>
+#include <limits>
+#include <sstream>
+#include "ns3/log.h"
+#include "ns3/uinteger.h"
+#include "ns3/address.h"
+#include "ns3/mac48-address.h"
+#include "ns3/mobility-model.h"
+#include "ns3/trace-source-accessor.h"
+#include "ns3/nstime.h"
+#include "ns3/boolean.h"
+#include "bp-rt-epidemic.h"
+#include "bp-header.h"
+#include "bp-contact.h"
+#include "bp-link-manager.h"
+#include "bp-neighbourhood-detection-agent.h"
+#include "bp-rt-sprayandwaitv1.h"
+
+NS_LOG_COMPONENT_DEFINE ("RTSprayAndWaitV1");
+
+namespace ns3 {
+namespace bundleProtocol {
+
+NS_OBJECT_ENSURE_REGISTERED (RTSprayAndWaitV1);
+
+TypeId RTSprayAndWaitV1::GetTypeId(void) {
+	static TypeId tid = TypeId ("ns3::bundleProtocol::RTSprayAndWaitV1")
+		.SetParent<BundleRouter> ()
+		.AddConstructor<RTSprayAndWaitV1> ()
+		.AddAttribute ("AlwaysSendHello",
+				"Sets if the router always should send hellos or only when it have something to send.",
+				BooleanValue (true),
+				MakeBooleanAccessor (&RTSprayAndWaitV1::m_alwaysSendHello),
+				MakeBooleanChecker ())
+		.AddTraceSource ("RedundantRelay", "A message already held in the buffer has been received.",
+				MakeTraceSourceAccessor (&RTSprayAndWaitV1::m_redundantRelayLogger));
+
+	return tid;
+}
+
+RTSprayAndWaitV1::RTSprayAndWaitV1() : BundleRouter(), m_send_timer((Timer::CANCEL_ON_DESTROY))
+{
+}
+
+RTSprayAndWaitV1::~RTSprayAndWaitV1()
+{
+}
+
+void RTSprayAndWaitV1::DoInit()
+{
+	if (m_alwaysSendHello) {
+		m_nda->Start();
+	}
+}
+
+void RTSprayAndWaitV1::DoDispose()
+{
+	BundleRouter::DoDispose();
+}
+
+void RTSprayAndWaitV1::DoLinkClosed(Ptr<Link> link)
+{
+	if (link->GetContact() != 0) {
+		BundleList bundles = link->GetContact()->GetQueuedBundles();
+		for (BundleList::iterator iter = bundles.begin(); iter != bundles.end(); ++iter) {
+			link->GetContact()->DequeueBundle(*iter);
+			CancelTransmission(*iter, link);
+		}
+	}
+
+	RemoveRouterSpecificBundles(link);
+}
+
+void RTSprayAndWaitV1::RemoveRouterSpecificBundles(Ptr<Link> link)
+{
+}
+
+void RTSprayAndWaitV1::PauseLink(Ptr<Link> link)
+{
+	if (link->GetState() == LINK_CONNECTED) {
+		BundleList bundles = link->GetContact()->GetQueuedBundles();
+
+		for (BundleList::iterator iter = bundles.begin(); iter != bundles.end(); ++iter) {
+			link->GetContact()->DequeueBundle(*iter);
+			CancelTransmission(*iter, link);
+		}
+
+		link->ChangeState(LINK_PAUSED);
+
+		Ptr<Contact> c = link->GetContact();
+
+		if (c->GetRetransmissions() >= m_maxRetries) {
+			m_linkManager->CloseLink(link);
+		} else {
+			c->IncreaseRetransmissions();
+			Simulator::Schedule(m_pauseTime,
+					&RTSprayAndWaitV1::UnPauseLink, this, link);
+		}
+	}
+	Simulator::ScheduleNow(&RTSprayAndWaitV1::TryToStartSending, this);
+}
+
+void RTSprayAndWaitV1::UnPauseLink(Ptr<Link> link)
+{
+	if (link->GetState() == LINK_PAUSED) {
+		link->ChangeState(LINK_CONNECTED);
+		Simulator::ScheduleNow(&RTSprayAndWaitV1::TryToStartSending, this);
+	}
+}
+
+void RTSprayAndWaitV1::DoLinkDiscovered(Ptr<Link> link)
+{
+	m_linkManager->OpenLink(link);
+	Simulator::ScheduleNow(&RTSprayAndWaitV1::TryToStartSending, this);
+}
+
+void RTSprayAndWaitV1::DoBundleReceived(Ptr<Bundle> bundle)
+{
+
+        SetBundleReceived("RTSprayAndWaitV1.out",bundle);
+	Ptr<Link> link = m_linkManager->FindLink(
+			bundle->GetReceivedFrom().front().GetEndpoint());
+	if (link != 0) {
+		link->UpdateLastHeardFrom();
+	}
+}
+
+Ptr<Bundle> RTSprayAndWaitV1::DoSendBundle(Ptr<Link> link, Ptr<Bundle> bundle)
+{
+	link->GetContact()->EnqueueBundle(bundle);
+	bundle->SetReplicationFactor(bundle->GetReplicationFactor()/2);/*Fica com Metade das Cópias
+	 Quando o numero de copias é igual a 1, o protocolo entra no modo wait, ou seja ele vai repassar
+	 a copia agora apenas para o Nó Destino*/
+	Ptr<Bundle> send = bundle->Copy();
+	/*set Tempo de vida para copia*/
+	send->SetLifetime(200);
+	return send;
+}
+
+void RTSprayAndWaitV1::DoBundleSent(const Address& address,
+		const GlobalBundleIdentifier& gbid, bool finalDelivery)
+{
+	Mac48Address mac = Mac48Address::ConvertFrom(address);
+	Ptr<Link> link = m_linkManager->FindLink(mac);
+
+	Ptr<Bundle> bundle = GetBundle(gbid);
+	if (bundle != 0) {
+		// I have received an ack for the sent bundle, so i have heard from the
+		// other node.
+		link->UpdateLastHeardFrom();
+
+		if (link->GetState() == LINK_CONNECTED || link->GetState()
+				== LINK_PAUSED) {
+			link->GetContact()->DequeueBundle(gbid);
+			link->GetContact()->ResetRetransmissions();
+		}
+
+		m_forwardLog.AddEntry(bundle, link);
+
+		if (finalDelivery) {
+			BundleDelivered(bundle, true);
+		}
+
+		Simulator::ScheduleNow(&RTSprayAndWaitV1::TryToStartSending, this);
+	} else {
+		if (finalDelivery) {
+			// This is a ugly hack utilitzing the fact that i know that
+			// the ttl is "inifinite".
+			Ptr<Bundle> bundle = Create<Bundle> ();
+			bundle->SetSourceEndpoint(gbid.GetSourceEid());
+			bundle->SetCreationTimestamp(gbid.GetCreationTimestamp());
+			bundle->SetLifetime(43000);
+			BundleDelivered(bundle, true);
+
+			Simulator::ScheduleNow(&RTSprayAndWaitV1::TryToStartSending, this);
+		}
+	}
+}
+
+void RTSprayAndWaitV1::DoBundleTransmissionFailed(const Address& address,
+		const GlobalBundleIdentifier& gbid)
+{
+	Mac48Address mac = Mac48Address::ConvertFrom(address);
+	Ptr<Link> link = m_linkManager->FindLink(mac);
+	PauseLink(link);
+}
+
+bool RTSprayAndWaitV1::DoAcceptBundle(Ptr<Bundle> bundle,
+		bool fromApplication)
+{
+	if (HasBundle(bundle)) {
+		m_redundantRelayLogger(bundle);
+		Ptr<Bundle> otherBundle = GetBundle(bundle->GetBundleId());
+		otherBundle->AddReceivedFrom(bundle->GetReceivedFrom().front());
+		return false;
+	}
+	return CanMakeRoomForBundle(bundle);
+}
+
+bool RTSprayAndWaitV1::DoCanDeleteBundle(const GlobalBundleIdentifier& gbid)
+{
+	return true;
+}
+
+void RTSprayAndWaitV1::DoInsert(Ptr<Bundle> bundle)
+{
+	// This is my extra thing, i always set the eid to current node holding the bundle.
+	bundle->SetCustodianEndpoint(m_eid);
+
+	m_bundleList.push_back(bundle);
+
+	// If this is the first bundle, I now want to begin sending hello messages announcing that
+	// I have something to send. If there is more than one bundle in the queue this means that
+	// I already have started sending hello messages.
+	if (m_nBundles == 1 && !m_alwaysSendHello) {
+		m_nda->Start();
+	}
+
+	Simulator::ScheduleNow(&RTSprayAndWaitV1::TryToStartSending, this);
+}
+
+bool RTSprayAndWaitV1::CanMakeRoomForBundle(Ptr<Bundle> bundle)
+{
+	if (bundle->GetSize() < m_maxBytes) {
+		return true;
+	} else {
+		return false;
+	}
+
+}
+
+bool RTSprayAndWaitV1::MakeRoomForBundle(Ptr<Bundle> bundle)
+{
+	if (bundle->GetSize() < m_maxBytes) {
+		if (bundle->GetSize() < GetFreeBytes()) {
+			return true;
+		}
+	    BundleList::iterator ite = m_bundleList.begin();
+		Ptr<Bundle> forDeletion = *(ite);
+
+		for (BundleList::iterator iter = m_bundleList.begin(); iter
+										!= m_bundleList.end();) {
+			Ptr<Bundle> currentBundle = *(iter++);
+			if(forDeletion->GetReplicationFactor() > currentBundle->GetReplicationFactor() ){
+				forDeletion = currentBundle;
+			}
+		}
+		if(forDeletion)
+		{
+			DeleteBundle(forDeletion, false);
+		}
+		if (bundle->GetSize() < GetFreeBytes()) {
+				return true;
+		}
+
+	    //for (BundleList::reverse_iterator iter = m_bundleList.rbegin(); iter
+                               // != m_bundleList.rend();) {
+				/*Politica atual: remove o elemento mais velho da fila para colocar o que chegou*/
+                /*for (BundleList::iterator iter = m_bundleList.begin(); iter
+                                                != m_bundleList.end();) {
+                        Ptr<Bundle> currentBundle = *(iter++);
+
+                        DeleteBundle(currentBundle, true);
+                        if (bundle->GetSize() < GetFreeBytes()) {
+                                return true;
+                        }
+                }*/
+		}
+		SetBufferOverFlow("RTSprayAndWaitV1.buff");
+
+	return false;
+}
+
+bool RTSprayAndWaitV1::DoDelete(const GlobalBundleIdentifier& gbid,
+		bool drop)
+{
+	// If this is the last bundle in the queue, stop sending Hello messages.
+	if (m_nBundles == 1 && !m_alwaysSendHello) {
+		//m_nda->Stop();
+	}
+	if (drop)/*drop = true indica que o bundle expirou por isso está sendo apagado*/
+	{
+                SetBundleExpired("RTSprayAndWaitV1.expired");
+	}
+	return BundleRouter::DoDelete(gbid, drop);
+}
+
+void RTSprayAndWaitV1::DoCancelTransmission(Ptr<Bundle> bundle,
+		Ptr<Link> link)
+{
+}
+
+void RTSprayAndWaitV1::DoTransmissionCancelled(const Address& address,
+		const GlobalBundleIdentifier& gbid)
+{
+	Mac48Address mac = Mac48Address::ConvertFrom(address);
+	Ptr<Link> link = m_linkManager->FindLink(mac);
+	if(link->GetContact())
+	{
+            link->GetContact()->DequeueBundle(gbid);
+	}
+
+	Simulator::ScheduleNow(&RTSprayAndWaitV1::TryToStartSending, this);
+}
+
+bool RTSprayAndWaitV1::IsDirectLink(Ptr <Link> link, Ptr <Bundle> bundle)
+{
+	if (link->GetRemoteEndpointId()== bundle->GetDestinationEndpoint())
+	{
+		return true;
+	}
+	return false;
+}
+
+void RTSprayAndWaitV1::TryToStartSending()
+{
+	NS_LOG_DEBUG("(" << m_node->GetId () << ")");
+	RemoveExpiredBundles(true);
+	m_forwardLog.RemoveExpiredEntries();
+
+	if (!IsSending() && (GetNBundles() > 0)) {
+		LinkBundle linkBundle = FindNextToSend();
+
+
+		if(!linkBundle.IsNull()){
+			NS_LOG_DEBUG("(" << m_node->GetId () << ") NumCopys: " << linkBundle.GetBundle()->GetReplicationFactor());
+		}
+
+		/*Se o número de copias é maior que 1, o bundle pode ser repassado, ou ele também pode ser enviado
+				  Caso seja um Link Direto*/
+		if ( !linkBundle.IsNull()) {
+			linkBundle.GetBundle()->SetCustodyTransferRequested(false);
+			linkBundle.GetBundle()->AddReceivedFrom(linkBundle.GetLink()->GetRemoteEndpointId().GetId());
+			SendBundle(linkBundle.GetLink(), linkBundle.GetBundle());
+		} else {
+			Simulator::Schedule (Seconds(1.0), &RTSprayAndWaitV1::TryToStartSending, this);
+		}
+	}
+}
+
+LinkBundle RTSprayAndWaitV1::FindNextToSend()
+{
+	NS_LOG_DEBUG("RTSprayAndWaitV1::FindNextToSend");
+	NS_LOG_DEBUG("(" << m_node->GetId() << ") - m_linkManager->GetConnectedLinks().size()= " << m_linkManager->GetConnectedLinks().size() << " GetNBundles() = " << GetNBundles() );
+	if ((m_linkManager->GetConnectedLinks().size() > 0) && (GetNBundles() > 0)) {
+		LinkBundleList lbl = GetAllDeliverableBundles();
+		if (!lbl.empty()) {
+		     LinkBundle result = lbl[0];// = lbl.front();
+		        uint32_t l = 0;
+				for (unsigned int i = 0 ; i < lbl.size(); i++){
+					if(IsDirectLink(lbl[i].GetLink(), lbl[i].GetBundle())){
+						result = lbl[i];
+						return lbl[i];
+					}
+					if(lbl[i].GetBundle()->GetReplicationFactor() > l){
+						l = lbl[i].GetBundle()->GetReplicationFactor();
+						result = lbl[i];
+					}
+
+				}
+			return result;
+		}
+	}
+	return LinkBundle(0, 0);
+}
+
+LinkBundle RTSprayAndWaitV1::GetNextRouterSpecific()
+{
+	return LinkBundle(0, 0);
+}
+
+LinkBundleList RTSprayAndWaitV1::GetAllDeliverableBundles()
+{
+	Links links = m_linkManager->GetConnectedLinks();
+	LinkBundleList result;
+	for (Links::iterator iter = links.begin(); iter != links.end(); ++iter) {
+		Ptr<Link> link = *iter;
+		LinkBundleList linkBundleList = GetAllBundlesForLink(link);
+		result.insert(result.end(), linkBundleList.begin(),
+				linkBundleList.end());
+	}
+	return result;
+}
+
+LinkBundleList RTSprayAndWaitV1::GetAllBundlesForLink(Ptr<Link> link)
+{
+	LinkBundleList linkBundleList;
+	LinkBundleList direct;
+	if (link->GetState() == LINK_CONNECTED) {
+		if (link->GetState() == LINK_CONNECTED) {
+			for (BundleList::iterator iter = m_bundleList.begin(); iter
+					!= m_bundleList.end(); ++iter) {
+				Ptr<Bundle> bundle = *iter;
+				/*
+				if (bundle->HasRetentionConstraint(RC_FORWARDING_PENDING)
+						&& !bundle->HaveBeenReceivedFrom(link)
+						&& (link->GetRemoteEndpointId()
+								== bundle->GetDestinationEndpoint())
+						&& !m_forwardLog.HasEntry(bundle, link)) {
+					linkBundleList.push_back(LinkBundle(link, *iter));
+				}
+				*/
+				if(!bundle->HaveBeenReceivedFrom(link->GetRemoteEndpointId().GetId()) && link->GetRemoteEndpointId() == bundle->GetDestinationEndpoint()){
+					direct.push_back(LinkBundle(link,*iter));
+					return direct;
+				}
+				else if (!bundle->HaveBeenReceivedFrom(link) && !m_forwardLog.HasEntry(bundle, link) && (bundle->GetReplicationFactor() > 1))
+				{
+					linkBundleList.push_back(LinkBundle(link,*iter));
+				}
+
+			}
+		}
+	}
+	return linkBundleList;
+}
+
+uint8_t RTSprayAndWaitV1::DoCalculateReplicationFactor(
+		const BundlePriority& priority) const
+{
+	return 1;
+}
+
+bool RTSprayAndWaitV1::DoIsRouterSpecific(Ptr<Bundle> bundle)
+{
+	return false;
+}
+
+bool RTSprayAndWaitV1::DoIsRouterSpecific(const BlockType& block)
+{
+	return false;
+}
+
+void RTSprayAndWaitV1::SendRouterSpecific(Ptr<Link> link,
+		Ptr<Bundle> bundle)
+{
+}
+
+void RTSprayAndWaitV1::SentRouterSpecific(Ptr<Link> link,
+		const GlobalBundleIdentifier& gbid)
+{
+}
+
+void RTSprayAndWaitV1::ReceiveRouterSpecific(Ptr<Bundle> bundle)
+{
+}
+
+void RTSprayAndWaitV1::AddRouterSpecificBundle(Ptr<Bundle> bundle)
+{
+}
+
+void RTSprayAndWaitV1::RemoveRouterSpecificBundle(
+		const GlobalBundleIdentifier& gbid, uint8_t reason)
+{
+}
+
+bool RTSprayAndWaitV1::HasRouterSpecificBundle(
+		const GlobalBundleIdentifier& gbid)
+{
+	return false;
+}
+
+Ptr<Bundle> RTSprayAndWaitV1::GetRouterSpecificBundle(
+		const GlobalBundleIdentifier& gbid)
+{
+	return Create<Bundle> ();
+}
+
+void RTSprayAndWaitV1::DoBundleDelivered(Ptr<Bundle> bundle, bool fromAck) {
+	NS_LOG_DEBUG("(" << m_node->GetId() << ") - From = " << bundle->GetCustodianEndpoint() << " - fromAck = " << fromAck);
+
+	m_kdm.Insert(bundle);
+
+	BundleList bl;
+	for (BundleList::iterator iter = m_bundleList.begin(); iter != m_bundleList.end(); ++iter) {
+		NS_LOG_DEBUG("--> BUNDLE EID: " << (*iter)->GetCustodianEndpoint());
+		Ptr<Bundle> bundle = *iter;
+		if (m_kdm.Has(bundle)) {
+			bl.push_back(bundle);
+			m_forwardLog.RemoveEntriesFor(bundle->GetBundleId());
+		}
+	}
+
+	for (BundleList::iterator iter = bl.begin(); iter != bl.end(); ++iter) {
+		NS_LOG_DEBUG("--> Delivered EID: " << (*iter)->GetBundleId());
+		DeleteBundle(*iter, false);
+	}
+}
+
+Ptr<Link> RTSprayAndWaitV1::DoCreateLink(const BundleEndpointId& eid, const Address& address)
+{
+	//NS_LOG_DEBUG ("(" << m_node->GetId () << ") "  << "RTSprayAndWaitV1::DoCreateLink");
+	Ptr<ConvergenceLayerAgent> cla = m_node->GetObject<BundleProtocolAgent>()->GetConvergenceLayerAgent();
+	Ptr<Link> link = CreateObject<Link> ();
+
+	link->SetLinkLostCallback(MakeCallback(&ConvergenceLayerAgent::LinkLost, cla));
+
+	link->SetRemoteEndpointId(eid);
+	link->SetRemoteAddress(address);
+
+	return link;
+}
+
+/*sergioviera*/
+void RTSprayAndWaitV1::DoSendHello(Ptr<Socket> socket, BundleEndpointId eid)
+{
+	NeighHeader header;
+	header.SetBundleEndpointId(m_eid);
+
+	if(Simulator::Now ().GetSeconds () > curTime - 10)
+	{
+		m_nda->Stop();
+		while(!m_bundleList.empty()){m_bundleList.pop_front();}
+	}
+	else
+	{
+		/* SprayAndWait Type */
+		TypeTag type(5);
+
+		Ptr<Packet> hello = Create<Packet>();
+		hello->AddPacketTag(type);
+		hello->AddHeader(header);
+
+		NS_LOG_DEBUG ("(" << m_node->GetId () << ") - eid = " << m_eid);
+
+		socket->Send(hello);
+	}
+}
+void RTSprayAndWaitV1::DoHandleHello(Ptr<Socket> socket)
+{
+	Ptr<MobilityModel> mm = m_node->GetObject<MobilityModel> ();
+	NS_LOG_DEBUG ("(" << m_node->GetId () << ") - " << mm->GetPosition ());
+
+	Ptr<Packet> receivedHello;
+	Address fromAddress;
+	receivedHello = socket->RecvFrom(fromAddress);
+
+	NeighHeader header;
+	receivedHello->PeekHeader(header);
+
+	NS_LOG_DEBUG ("(" << m_node->GetId () << ") - eid = " << header.GetBundleEndpointId());
+
+	Simulator::ScheduleNow(&NeighbourhoodDetectionAgent::NotifyDiscoveredLink,
+			m_nda, receivedHello, fromAddress);
+}
+/*sergioviera*/
+
+}
+} // namespace bundleProtocol, ns3
